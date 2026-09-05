@@ -1,0 +1,91 @@
+import numpy as np
+import cv2
+import logging
+from typing import List, Dict, Any, Tuple
+from app.tracking.tracker import TrackedPerson
+
+logger = logging.getLogger(__name__)
+
+class PoseEstimator:
+    def __init__(self):
+        self.mediapipe_available = False
+        self._init_mediapipe()
+
+    def _init_mediapipe(self):
+        try:
+            import mediapipe as mp
+            self.mp_pose = mp.solutions.pose
+            self.pose = self.mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+            self.mediapipe_available = True
+            logger.info("MediaPipe Pose Estimator initialized successfully.")
+        except Exception as e:
+            logger.info("MediaPipe not installed/available. Using geometric skeleton & temporal pose estimator.")
+            self.mediapipe_available = False
+
+    def estimate_pose_and_action(self, person: TrackedPerson, frame: np.ndarray) -> str:
+        """
+        Analyzes keypoints or geometric ratio to classify person action:
+        - "FALLEN"
+        - "UNSAFE_POSTURE"
+        - "RUNNING"
+        - "WORKING_AT_HEIGHT"
+        - "NORMAL"
+        """
+        box = person.box
+        x1, y1, x2, y2 = box
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        aspect_ratio = bw / bh
+        h_frame, w_frame = frame.shape[:2]
+
+        # 1. Fall Detection Check (Horizontal body ratio or sudden height drop)
+        if aspect_ratio > 1.25 or (y2 > h_frame * 0.85 and bh < h_frame * 0.25):
+            return "FALLEN"
+
+        # 2. Running Detection Check (High centroid velocity over recent frames)
+        if person.velocity > (w_frame * 0.25): # Moved >25% of frame width per second
+            return "RUNNING"
+
+        # 3. Working at Height Check (Person detected in top 20% of frame area elevated)
+        if y1 < (h_frame * 0.18) and y2 < (h_frame * 0.60):
+            return "WORKING_AT_HEIGHT"
+
+        # 4. Unsafe Posture Check (MediaPipe keypoint angle or stoop ratio analysis)
+        if self.mediapipe_available:
+            roi_x1 = max(0, int(x1))
+            roi_y1 = max(0, int(y1))
+            roi_x2 = min(w_frame, int(x2))
+            roi_y2 = min(h_frame, int(y2))
+            
+            if roi_x2 > roi_x1 and roi_y2 > roi_y1:
+                crop = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                results = self.pose.process(rgb_crop)
+                
+                if results.pose_landmarks:
+                    landmarks = results.pose_landmarks.landmark
+                    shoulder = [landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER].x, landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER].y]
+                    hip = [landmarks[self.mp_pose.PoseLandmark.LEFT_HIP].x, landmarks[self.mp_pose.PoseLandmark.LEFT_HIP].y]
+                    knee = [landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE].x, landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE].y]
+                    
+                    angle = self._calculate_angle(shoulder, hip, knee)
+                    if angle < 130 and angle > 45: # Bending spine stooping posture
+                        return "UNSAFE_POSTURE"
+
+        # Fallback Unsafe Posture check based on bounding box deformation
+        if 0.8 <= aspect_ratio <= 1.15 and bh > (h_frame * 0.2):
+            return "UNSAFE_POSTURE"
+
+        return "NORMAL"
+
+    def _calculate_angle(self, a: List[float], b: List[float], c: List[float]) -> float:
+        a = np.array(a)
+        b = np.array(b)
+        c = np.array(c)
+
+        radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+        angle = np.abs(radians*180.0/np.pi)
+
+        if angle > 180.0:
+            angle = 360.0 - angle
+        return angle
